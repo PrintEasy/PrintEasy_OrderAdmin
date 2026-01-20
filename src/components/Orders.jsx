@@ -1,5 +1,5 @@
 import { useState, useEffect } from 'react';
-import { generatePDF } from '../utils/pdfGenerator';
+import { generatePDF, generateCombinedPDF } from '../utils/pdfGenerator';
 import './Orders.css';
 
 const Orders = ({ onLogout }) => {
@@ -9,6 +9,8 @@ const Orders = ({ onLogout }) => {
   const [groupedOrders, setGroupedOrders] = useState({});
   const [generatingPDF, setGeneratingPDF] = useState({});
   const [pdfDownloadCount, setPdfDownloadCount] = useState(1);
+  const [downloadingAll, setDownloadingAll] = useState({});
+  const [downloadProgress, setDownloadProgress] = useState({});
 
   useEffect(() => {
     fetchOrders();
@@ -74,7 +76,7 @@ const Orders = ({ onLogout }) => {
     
     try {
       console.log('Generating PDF for order:', order.orderId);
-      await generatePDF(order, currentCount);
+      await generatePDF(order);
       console.log('PDF generated successfully');
     } catch (err) {
       console.error('PDF generation error:', err);
@@ -83,6 +85,48 @@ const Orders = ({ onLogout }) => {
       setGeneratingPDF(prev => {
         const newState = { ...prev };
         delete newState[order.orderId];
+        return newState;
+      });
+    }
+  };
+
+  const handleDownloadAllForDate = async (date) => {
+    const ordersForDate = groupedOrders[date] || [];
+    if (ordersForDate.length === 0) return;
+
+    // Prevent multiple clicks
+    if (downloadingAll[date]) return;
+
+    setDownloadingAll(prev => ({ ...prev, [date]: true }));
+    
+    // Calculate total items across all orders for progress tracking
+    const totalItems = ordersForDate.reduce((sum, order) => sum + order.items.length, 0);
+    setDownloadProgress(prev => ({ ...prev, [date]: { current: 0, total: totalItems } }));
+
+    try {
+      // Generate combined PDF with progress tracking
+      await generateCombinedPDF(
+        ordersForDate,
+        date,
+        (current, total) => {
+          setDownloadProgress(prev => ({
+            ...prev,
+            [date]: { current, total }
+          }));
+        }
+      );
+    } catch (err) {
+      console.error('Error downloading combined PDF:', err);
+      alert('Error downloading PDF: ' + (err.message || 'Unknown error'));
+    } finally {
+      setDownloadingAll(prev => {
+        const newState = { ...prev };
+        delete newState[date];
+        return newState;
+      });
+      setDownloadProgress(prev => {
+        const newState = { ...prev };
+        delete newState[date];
         return newState;
       });
     }
@@ -125,6 +169,32 @@ const Orders = ({ onLogout }) => {
           <div key={date} className="date-section">
             <div className="date-header">
               <span className="date-text">{date}</span>
+              <div className="date-header-actions">
+                {downloadingAll[date] && downloadProgress[date] ? (
+                  <div className="download-progress-container">
+                    <div className="download-progress-bar">
+                      <div 
+                        className="download-progress-fill"
+                        style={{ 
+                          width: `${(downloadProgress[date].current / downloadProgress[date].total) * 100}%` 
+                        }}
+                      ></div>
+                    </div>
+                    <span className="download-progress-text">
+                      {downloadProgress[date].current} / {downloadProgress[date].total}
+                    </span>
+                  </div>
+                ) : (
+                  <button
+                    className="download-all-button"
+                    onClick={() => handleDownloadAllForDate(date)}
+                    disabled={downloadingAll[date]}
+                    title={`Download all ${groupedOrders[date]?.length || 0} orders for ${date}`}
+                  >
+                    Download All ({groupedOrders[date]?.length || 0})
+                  </button>
+                )}
+              </div>
             </div>
             
             <div className="orders-grid">
