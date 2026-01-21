@@ -1,7 +1,7 @@
 import jsPDF from "jspdf";
 import JsBarcode from "jsbarcode";
 
-const loadImageAsBase64 = (url, quality = 0.5, applyThreshold = true) =>
+const loadImageAsBase64 = (url, quality = 0.5, applyThreshold = true, format = "jpeg") =>
   new Promise((resolve, reject) => {
     const img = new Image();
     img.crossOrigin = "anonymous";
@@ -12,9 +12,19 @@ const loadImageAsBase64 = (url, quality = 0.5, applyThreshold = true) =>
       canvas.height = img.height;
       const ctx = canvas.getContext("2d");
 
-      // Fill the background with white first (in case of transparent PNGs)
-      ctx.fillStyle = "#FFFFFF";
-      ctx.fillRect(0, 0, canvas.width, canvas.height);
+      // Enable high-quality image rendering - disable smoothing for pixel-perfect quality
+      // For maximum quality, we want to preserve exact pixels without interpolation
+      ctx.imageSmoothingEnabled = false; // Disable smoothing to preserve exact pixel values
+      
+      // For PNG format, don't fill with white to preserve transparency
+      // Only fill with white for JPEG format
+      if (format !== "png") {
+        ctx.fillStyle = "#FFFFFF";
+        ctx.fillRect(0, 0, canvas.width, canvas.height);
+      }
+      
+      // Draw image at exact original resolution - no scaling, no interpolation
+      // This preserves every pixel exactly as in the original image
       ctx.drawImage(img, 0, 0);
 
       // Only apply threshold processing if requested (for product images)
@@ -42,11 +52,18 @@ const loadImageAsBase64 = (url, quality = 0.5, applyThreshold = true) =>
         ctx.putImageData(imageData, 0, 0);
       }
       
-      // Use JPEG with specified quality
-      resolve(canvas.toDataURL("image/jpeg", quality));
+      // Use specified format (PNG for lossless, JPEG with quality for compressed)
+      if (format === "png") {
+        resolve(canvas.toDataURL("image/png"));
+      } else {
+        resolve(canvas.toDataURL("image/jpeg", quality));
+      }
     };
 
-    img.onerror = () => reject();
+    img.onerror = (error) => {
+      console.error("Error loading image in loadImageAsBase64:", error, "URL:", url);
+      reject(new Error(`Failed to load image from ${url}`));
+    };
     img.src = url;
   });
 
@@ -60,12 +77,23 @@ const safeLoadImage = async (url, quality = 0.5) => {
 
 // Higher quality loader for custom images (imageUrl)
 // Preserves all colors including text - no threshold processing
+// Uses PNG format for maximum quality (lossless) at original resolution
 const safeLoadCustomImage = async (url) => {
   try {
-    // Use higher quality (0.75) for custom images and preserve all colors
+    if (!url) {
+      console.warn("No image URL provided");
+      return null;
+    }
+    console.log("Loading custom image from URL:", url);
+    // Use PNG format for maximum quality (lossless, no compression artifacts)
     // applyThreshold = false to preserve text and all image details
-    return await loadImageAsBase64(url, 0.75, false);
-  } catch {
+    // PNG doesn't use quality parameter as it's lossless
+    // This preserves the original image resolution and quality
+    const imageData = await loadImageAsBase64(url, 1.0, false, "png");
+    console.log("Image loaded successfully, data length:", imageData ? imageData.length : 0);
+    return imageData;
+  } catch (error) {
+    console.error("Error loading custom image:", error, "URL:", url);
     return null;
   }
 };
@@ -88,25 +116,44 @@ const ensureSpace = (doc, y, neededHeight, margin = 20) => {
 /* ================= IMAGE DRAWERS ================= */
 const addFullWidthImage = (doc, imgData, y, margin = 15) => {
   const { width } = getPageSize(doc);
-  const usableWidth = width - margin * 2;
   const props = doc.getImageProperties(imgData);
-  const ratio = props.width / props.height;
+  
+  // Get original image dimensions in pixels (full resolution)
+  const originalWidthPx = props.width;
+  const originalHeightPx = props.height;
+  
+  // Calculate display size to fit page width (in mm)
+  // But we'll use the full pixel resolution as source
+  const usableWidth = width - margin * 2;
+  const ratio = originalWidthPx / originalHeightPx;
+  const displayWidth = usableWidth;
+  const displayHeight = displayWidth / ratio;
 
-  const imgWidth = usableWidth;
-  const imgHeight = imgWidth / ratio;
-
-  // Use JPEG compression in addImage
+  // Auto-detect format from data URL (PNG or JPEG)
+  const format = imgData.startsWith("data:image/png") ? "PNG" : "JPEG";
+  
+  // Use "SLOW" compression for maximum quality (best quality, larger file size)
+  // For PNG images, use "SLOW" to ensure highest quality preservation
+  // SLOW compression uses the best algorithm to preserve image quality
+  const compression = format === "PNG" ? "SLOW" : "SLOW"; // Use SLOW for both to maximize quality
+  
+  // Add image with full original pixel resolution
+  // The imgData (PNG) contains the full-resolution image data at originalWidthPx x originalHeightPx
+  // jsPDF will embed this at full resolution - the display dimensions only affect layout
+  // Using SLOW compression ensures maximum quality preservation during PDF creation
   doc.addImage(
     imgData,
-    "JPEG",
+    format,
     margin,
     y,
-    imgWidth,
-    imgHeight,
-    undefined,
-    "FAST",
+    displayWidth,
+    displayHeight,
+    undefined, // alias
+    compression,
+    0 // rotation
   );
-  return imgHeight;
+  
+  return displayHeight;
 };
 
 const addCenteredImage = (doc, imgData, y, maxWidth = 90) => {
@@ -145,12 +192,139 @@ const addBarcode = (doc, text, y) => {
   return h;
 };
 
+/* ================= RENDER CONTENT TO CANVAS PAGE ================= */
+const renderPageContentToCanvas = async (contentItems, pageWidthPx, pageHeightPx) => {
+  const canvas = document.createElement("canvas");
+  canvas.width = pageWidthPx;
+  canvas.height = pageHeightPx;
+  const ctx = canvas.getContext("2d");
+
+  // High-quality rendering settings
+  ctx.imageSmoothingEnabled = true;
+  ctx.imageSmoothingQuality = "high";
+
+  // White background
+  ctx.fillStyle = "#FFFFFF";
+  ctx.fillRect(0, 0, canvas.width, canvas.height);
+
+  // Scale factor: mm to pixels (300 DPI)
+  const mmToPx = pageWidthPx / 210; // A4 width in mm is 210
+  let y = 20 * mmToPx; // margin
+
+  for (const item of contentItems) {
+    // Draw header text (reduced size)
+    if (item.type === "header") {
+      ctx.fillStyle = "#000000";
+      ctx.font = `bold ${8 * mmToPx}px Arial`; // Reduced from 12 to 8
+      ctx.textAlign = "center";
+      ctx.textBaseline = "top";
+      ctx.fillText(item.text, pageWidthPx / 2, y);
+      y += 10 * mmToPx; // Reduced spacing
+    }
+
+    // Draw image (centered for maximum quality)
+    if (item.type === "image" && item.imageData) {
+      const img = new Image();
+      img.crossOrigin = "anonymous"; // Handle CORS
+      await new Promise((resolve, reject) => {
+        let resolved = false;
+        const timeout = setTimeout(() => {
+          if (!resolved) {
+            console.error("Image loading timeout");
+            reject(new Error("Image loading timeout"));
+          }
+        }, 30000); // 30 second timeout
+
+        img.onerror = (err) => {
+          clearTimeout(timeout);
+          if (!resolved) {
+            resolved = true;
+            console.error("Error loading image in canvas:", err, "Image data:", item.imageData ? item.imageData.substring(0, 100) : "null");
+            reject(err);
+          }
+        };
+        img.onload = () => {
+          try {
+            clearTimeout(timeout);
+            if (resolved) return;
+            resolved = true;
+            
+            console.log("Image loaded in canvas, dimensions:", img.width, "x", img.height);
+            
+            // Calculate size to fit page with margins while maintaining aspect ratio
+            const maxWidth = (pageWidthPx - 40 * mmToPx);
+            const maxHeight = (pageHeightPx - 50 * mmToPx); // Leave space for smaller header
+            const scale = Math.min(maxWidth / img.width, maxHeight / img.height);
+            const imgWidth = img.width * scale;
+            const imgHeight = img.height * scale;
+            const x = (pageWidthPx - imgWidth) / 2; // Center horizontally
+            const yPos = 30 * mmToPx; // Start below header
+            
+            console.log("Drawing image at:", { x, yPos, imgWidth, imgHeight, scale });
+            ctx.drawImage(img, x, yPos, imgWidth, imgHeight);
+            console.log("Image drawn successfully");
+            resolve();
+          } catch (err) {
+            if (!resolved) {
+              resolved = true;
+              console.error("Error drawing image:", err);
+              reject(err);
+            }
+          }
+        };
+        
+        console.log("Setting image source, data type:", typeof item.imageData, "Length:", item.imageData ? item.imageData.length : 0);
+        img.src = item.imageData;
+      });
+    }
+
+    // Draw barcode (centered, larger for better quality)
+    if (item.type === "barcode" && item.barcodeData) {
+      const barcodeImg = new Image();
+      await new Promise((resolve) => {
+        barcodeImg.onload = () => {
+          // Use larger size for better quality
+          const barcodeWidth = 120 * mmToPx;
+          const barcodeHeight = (barcodeImg.height / barcodeImg.width) * barcodeWidth;
+          const x = (pageWidthPx - barcodeWidth) / 2;
+          const yPos = (pageHeightPx - barcodeHeight) / 2; // Center vertically
+          ctx.drawImage(barcodeImg, x, yPos, barcodeWidth, barcodeHeight);
+          resolve();
+        };
+        barcodeImg.src = item.barcodeData;
+      });
+    }
+
+    // Draw separator
+    if (item.type === "separator") {
+      if (item.isOrderSeparator) {
+        // Thicker line for order separator
+        ctx.strokeStyle = "#C8C8C8";
+        ctx.lineWidth = 2 * mmToPx;
+        y += 10 * mmToPx;
+      } else {
+        ctx.strokeStyle = "#DCDCDC";
+        ctx.lineWidth = 1;
+      }
+      ctx.beginPath();
+      ctx.moveTo(40 * mmToPx, y);
+      ctx.lineTo((pageWidthPx - 40 * mmToPx), y);
+      ctx.stroke();
+      y += 15 * mmToPx;
+    }
+  }
+
+  return canvas.toDataURL("image/png");
+};
+
 /* ================= MAIN PDF ================= */
 export const generatePDF = async (order, onProgress) => {
-  // OPTIMIZATION: Set compress: true in the constructor
+  // Create PDF with high quality settings
   const doc = new jsPDF({
     compress: true,
-    precision: 2, // Reduce precision for smaller file size
+    precision: 16,
+    unit: "mm",
+    format: "a4",
   });
 
   const margin = 20;
@@ -159,49 +333,231 @@ export const generatePDF = async (order, onProgress) => {
   for (let i = 0; i < order.items.length; i++) {
     const item = order.items[i];
 
-    // Report progress if callback provided
+    // Report progress
     if (onProgress) {
       onProgress(i + 1, order.items.length);
     }
 
-    /* ---------- ITEM HEADER ---------- */
-    y = ensureSpace(doc, y, 30);
-    doc.setFontSize(12);
-    doc.setFont(undefined, "bold");
-    doc.text(
-      `Order ${order.orderId} — Item ${i + 1}/${order.items.length}`,
-      getPageSize(doc).width / 2,
-      y,
-      { align: "center" },
-    );
-    y += 15;
+    // PAGE 1: Image page (if image exists)
+    const imageUrl = item.imageUrl || item.renderedImageUrl;
+    console.log("Processing item", i, "imageUrl:", imageUrl);
+    
+    if (imageUrl) {
+      if (i > 0 || y > margin) doc.addPage();
+      y = margin;
 
-    /* ---------- LARGE CUSTOM IMAGE ---------- */
-    const customImg = await safeLoadCustomImage(
-      item.imageUrl || item.renderedImageUrl,
-    );
-    if (customImg) {
-      const props = doc.getImageProperties(customImg);
-      const tempHeight =
-        (getPageSize(doc).width - 30) / (props.width / props.height);
+      // Load custom image with transparency preserved
+      console.log("Loading image for item", i);
+      const customImg = await safeLoadCustomImage(imageUrl);
+      console.log("Image loaded result:", customImg ? "Success" : "Failed");
+      
+      if (customImg) {
+        try {
+          // Get image dimensions for sizing
+          let imgWidth = 0;
+          let imgHeight = 0;
+          
+          // Try to get dimensions from the image data
+          const img = new Image();
+          img.crossOrigin = "anonymous";
+          await new Promise((resolve, reject) => {
+            const timeout = setTimeout(() => {
+              reject(new Error("Image verification timeout"));
+            }, 10000);
+            
+            img.onerror = (err) => {
+              clearTimeout(timeout);
+              console.warn("Warning: Could not verify image dimensions, using default:", err);
+              // Use default dimensions if verification fails
+              imgWidth = 800;
+              imgHeight = 600;
+              resolve();
+            };
+            img.onload = () => {
+              clearTimeout(timeout);
+              imgWidth = img.width;
+              imgHeight = img.height;
+              console.log("Image verified, dimensions:", imgWidth, "x", imgHeight);
+              resolve();
+            };
+            img.src = customImg;
+          });
+          
+          if (imgWidth === 0 || imgHeight === 0) {
+            console.warn("Invalid image dimensions, using defaults");
+            imgWidth = 800;
+            imgHeight = 600;
+          }
+          
+          // Calculate image size to fill PDF page (minimal margins for larger size)
+          const pageWidth = getPageSize(doc).width;
+          const pageHeight = getPageSize(doc).height;
+          const minMargin = 5; // Minimal margin for larger image
+          
+          // Calculate to fill page width (with minimal margins)
+          const availableWidth = pageWidth - (minMargin * 2);
+          const availableHeight = pageHeight - (minMargin * 2);
+          
+          // Calculate scale to fit both width and height, use the larger scale to fill page
+          const widthScale = availableWidth / imgWidth;
+          const heightScale = availableHeight / imgHeight;
+          const scale = Math.max(widthScale, heightScale); // Use max to fill page
+          
+          let finalWidth = imgWidth * scale;
+          let finalHeight = imgHeight * scale;
+          
+          // Ensure it doesn't exceed page boundaries
+          if (finalWidth > pageWidth) {
+            finalWidth = pageWidth;
+            finalHeight = (finalWidth / imgWidth) * imgHeight;
+          }
+          if (finalHeight > pageHeight) {
+            finalHeight = pageHeight;
+            finalWidth = (finalHeight / imgHeight) * imgWidth;
+          }
 
-      y = ensureSpace(doc, y, tempHeight);
-      y += addFullWidthImage(doc, customImg, y);
-      y += 10;
+          // Center the image on the page
+          const xPos = (pageWidth - finalWidth) / 2;
+          const yPos = (pageHeight - finalHeight) / 2;
+
+          console.log("Adding image to PDF (large size):", { 
+            pageWidth,
+            pageHeight,
+            finalWidth, 
+            finalHeight,
+            xPos,
+            yPos,
+            sourceWidth: imgWidth,
+            sourceHeight: imgHeight,
+            scale,
+            imageDataLength: customImg.length
+          });
+          
+          // Add image with PNG format (preserves transparency, no white background)
+          doc.addImage(
+            customImg,
+            "PNG",
+            xPos,
+            yPos,
+            finalWidth,
+            finalHeight,
+            undefined,
+            "SLOW"
+          );
+          
+          console.log("Image added to PDF successfully");
+        } catch (error) {
+          console.error("Error adding image to PDF:", error);
+          // Try to add image anyway with default dimensions
+          try {
+            console.log("Attempting to add image with default dimensions");
+            const pageWidth = getPageSize(doc).width;
+            const defaultWidthMm = pageWidth - (margin * 2);
+            const defaultHeightMm = defaultWidthMm * 0.75; // 4:3 aspect ratio
+            const xPos = (pageWidth - defaultWidthMm) / 2;
+            doc.addImage(
+              customImg,
+              "PNG",
+              xPos,
+              y,
+              defaultWidthMm,
+              defaultHeightMm,
+              undefined,
+              "SLOW"
+            );
+            console.log("Image added with default dimensions");
+          } catch (fallbackError) {
+            console.error("Failed to add image even with default dimensions:", fallbackError);
+          }
+        }
+      } else {
+        console.warn("No image data returned for item", i, "URL was:", imageUrl);
+      }
+    } else {
+      console.warn("No imageUrl found for item", i);
     }
 
-    /* ---------- BARCODE (SKU REMOVED) ---------- */
-    // Updated logic: only OrderID and Item Index
-    const barcodeText = `${order.orderId}-${i + 1}`;
-    y = ensureSpace(doc, y, 60);
-    y += addBarcode(doc, barcodeText, y);
+    // PAGE 2: Barcode page with details
+    doc.addPage();
+    y = margin;
+
+    // Get item details
+    const sku = item.sku || item.productSku || "N/A";
+    const quantity = item.quantity || item.qty || 1;
+    const size = item.size || item.variantSize || "N/A";
+    const name = item.name || "Customizable Product";
+
+    // Add product name
+    doc.setFontSize(10);
+    doc.setFont(undefined, "bold");
+    doc.text(`Name: ${name}`, getPageSize(doc).width / 2, y, { align: "center" });
+    y += 8;
+
+    // Add SKU
+    doc.setFontSize(10);
+    doc.setFont(undefined, "normal");
+    doc.text(`SKU: ${sku}`, getPageSize(doc).width / 2, y, { align: "center" });
+    y += 8;
+
+    // Add Quantity
+    doc.text(`Qty: ${quantity}`, getPageSize(doc).width / 2, y, { align: "center" });
+    y += 8;
+
+    // Add Size
+    doc.text(`Size: ${size}`, getPageSize(doc).width / 2, y, { align: "center" });
     y += 15;
 
-    /* ---------- SEPARATOR ---------- */
-    y = ensureSpace(doc, y, 15);
-    doc.setDrawColor(220);
-    doc.line(40, y, getPageSize(doc).width - 40, y);
-    y += 15;
+      // Create barcode with transparent background
+      const barcodeCanvas = document.createElement("canvas");
+      barcodeCanvas.width = 400;
+      barcodeCanvas.height = 200;
+      const barcodeCtx = barcodeCanvas.getContext("2d");
+      
+      // Clear canvas completely (transparent background - no white fill)
+      barcodeCtx.clearRect(0, 0, barcodeCanvas.width, barcodeCanvas.height);
+      
+      // Generate barcode with only orderId (no -1)
+      // Note: JsBarcode may add background by default, we'll handle it
+      JsBarcode(barcodeCanvas, `${order.orderId}`, {
+        format: "CODE128",
+        width: 3,
+        height: 80,
+        displayValue: true,
+        fontSize: 20,
+        margin: 10,
+      });
+      
+      // Remove any white background that JsBarcode might have added
+      // by converting white pixels to transparent
+      const imageData = barcodeCtx.getImageData(0, 0, barcodeCanvas.width, barcodeCanvas.height);
+      const data = imageData.data;
+      for (let i = 0; i < data.length; i += 4) {
+        const r = data[i];
+        const g = data[i + 1];
+        const b = data[i + 2];
+        // If pixel is white (or very close to white), make it transparent
+        if (r > 250 && g > 250 && b > 250) {
+          data[i + 3] = 0; // Set alpha to 0 (transparent)
+        }
+      }
+      barcodeCtx.putImageData(imageData, 0, 0);
+    
+    const barcodeData = barcodeCanvas.toDataURL("image/png");
+
+    // Add barcode to PDF (centered)
+    const barcodeWidth = 100;
+    const barcodeHeight = 50;
+    const barcodeX = (getPageSize(doc).width - barcodeWidth) / 2;
+    doc.addImage(
+      barcodeData,
+      "PNG",
+      barcodeX,
+      y,
+      barcodeWidth,
+      barcodeHeight,
+      undefined,
+      "SLOW"
+    );
   }
 
   doc.save(`order-${order.orderId}.pdf`);
@@ -209,10 +565,12 @@ export const generatePDF = async (order, onProgress) => {
 
 /* ================= GENERATE COMBINED PDF FOR MULTIPLE ORDERS ================= */
 export const generateCombinedPDF = async (orders, dateKey, onProgress) => {
-  // OPTIMIZATION: Set compress: true in the constructor
+  // Create PDF with high quality settings
   const doc = new jsPDF({
     compress: true,
-    precision: 2, // Reduce precision for smaller file size
+    precision: 16,
+    unit: "mm",
+    format: "a4",
   });
 
   const margin = 20;
@@ -229,15 +587,6 @@ export const generateCombinedPDF = async (orders, dateKey, onProgress) => {
   for (let orderIndex = 0; orderIndex < orders.length; orderIndex++) {
     const order = orders[orderIndex];
 
-    // Add order separator if not first order
-    if (orderIndex > 0) {
-      y = ensureSpace(doc, y, 30);
-      doc.setDrawColor(200);
-      doc.setLineWidth(2);
-      doc.line(40, y, getPageSize(doc).width - 40, y);
-      y += 20;
-    }
-
     for (let i = 0; i < order.items.length; i++) {
       const item = order.items[i];
       processedItems++;
@@ -247,44 +596,223 @@ export const generateCombinedPDF = async (orders, dateKey, onProgress) => {
         onProgress(processedItems, totalItems);
       }
 
-      /* ---------- ITEM HEADER ---------- */
-      y = ensureSpace(doc, y, 30);
-      doc.setFontSize(12);
-      doc.setFont(undefined, "bold");
-      doc.text(
-        `Order ${order.orderId} — Item ${i + 1}/${order.items.length}`,
-        getPageSize(doc).width / 2,
-        y,
-        { align: "center" },
-      );
-      y += 15;
+      // PAGE 1: Image page (if image exists)
+      const imageUrl = item.imageUrl || item.renderedImageUrl;
+      console.log("Processing item", i, "order", order.orderId, "imageUrl:", imageUrl);
+      
+      if (imageUrl) {
+        if (processedItems > 1 || y > margin) doc.addPage();
+        y = margin;
 
-      /* ---------- LARGE CUSTOM IMAGE ---------- */
-      const customImg = await safeLoadCustomImage(
-        item.imageUrl || item.renderedImageUrl,
-      );
-      if (customImg) {
-        const props = doc.getImageProperties(customImg);
-        const tempHeight =
-          (getPageSize(doc).width - 30) / (props.width / props.height);
+        console.log("Loading image for combined PDF, item", i);
+        const customImg = await safeLoadCustomImage(imageUrl);
+        console.log("Image loaded result:", customImg ? "Success" : "Failed");
+        
+        if (customImg) {
+          try {
+            // Get image dimensions for sizing
+            let imgWidth = 0;
+            let imgHeight = 0;
+            
+            // Try to get dimensions from the image data
+            const img = new Image();
+            img.crossOrigin = "anonymous";
+            await new Promise((resolve, reject) => {
+              const timeout = setTimeout(() => {
+                reject(new Error("Image verification timeout"));
+              }, 10000);
+              
+              img.onerror = (err) => {
+                clearTimeout(timeout);
+                console.warn("Warning: Could not verify image dimensions in combined PDF, using default:", err);
+                // Use default dimensions if verification fails
+                imgWidth = 800;
+                imgHeight = 600;
+                resolve();
+              };
+              img.onload = () => {
+                clearTimeout(timeout);
+                imgWidth = img.width;
+                imgHeight = img.height;
+                console.log("Image verified in combined PDF, dimensions:", imgWidth, "x", imgHeight);
+                resolve();
+              };
+              img.src = customImg;
+            });
+            
+            if (imgWidth === 0 || imgHeight === 0) {
+              console.warn("Invalid image dimensions in combined PDF, using defaults");
+              imgWidth = 800;
+              imgHeight = 600;
+            }
+            
+            // Calculate image size to fill PDF page (minimal margins for larger size)
+            const pageWidth = getPageSize(doc).width;
+            const pageHeight = getPageSize(doc).height;
+            const minMargin = 5; // Minimal margin for larger image
+            
+            // Calculate to fill page width (with minimal margins)
+            const availableWidth = pageWidth - (minMargin * 2);
+            const availableHeight = pageHeight - (minMargin * 2);
+            
+            // Calculate scale to fit both width and height, use the larger scale to fill page
+            const widthScale = availableWidth / imgWidth;
+            const heightScale = availableHeight / imgHeight;
+            const scale = Math.max(widthScale, heightScale); // Use max to fill page
+            
+            let finalWidth = imgWidth * scale;
+            let finalHeight = imgHeight * scale;
+            
+            // Ensure it doesn't exceed page boundaries
+            if (finalWidth > pageWidth) {
+              finalWidth = pageWidth;
+              finalHeight = (finalWidth / imgWidth) * imgHeight;
+            }
+            if (finalHeight > pageHeight) {
+              finalHeight = pageHeight;
+              finalWidth = (finalHeight / imgHeight) * imgWidth;
+            }
 
-        y = ensureSpace(doc, y, tempHeight);
-        y += addFullWidthImage(doc, customImg, y);
-        y += 10;
+            // Center the image on the page
+            const xPos = (pageWidth - finalWidth) / 2;
+            const yPos = (pageHeight - finalHeight) / 2;
+
+            console.log("Adding image to combined PDF (large size):", { 
+              pageWidth,
+              pageHeight,
+              finalWidth, 
+              finalHeight,
+              xPos,
+              yPos,
+              sourceWidth: imgWidth,
+              sourceHeight: imgHeight,
+              scale
+            });
+            
+            // Add image with PNG format (preserves transparency, no white background)
+            doc.addImage(
+              customImg,
+              "PNG",
+              xPos,
+              yPos,
+              finalWidth,
+              finalHeight,
+              undefined,
+              "SLOW"
+            );
+            
+            console.log("Image added to combined PDF successfully");
+          } catch (error) {
+            console.error("Error adding image to combined PDF:", error);
+            // Try to add image anyway with default dimensions
+            try {
+              console.log("Attempting to add image to combined PDF with default dimensions");
+              const pageWidth = getPageSize(doc).width;
+              const defaultWidthMm = pageWidth - (margin * 2);
+              const defaultHeightMm = defaultWidthMm * 0.75; // 4:3 aspect ratio
+              const xPos = (pageWidth - defaultWidthMm) / 2;
+              doc.addImage(
+                customImg,
+                "PNG",
+                xPos,
+                y,
+                defaultWidthMm,
+                defaultHeightMm,
+                undefined,
+                "SLOW"
+              );
+              console.log("Image added to combined PDF with default dimensions");
+            } catch (fallbackError) {
+              console.error("Failed to add image to combined PDF even with default dimensions:", fallbackError);
+            }
+          }
+        } else {
+          console.warn("No image data returned for item", i, "in combined PDF, URL was:", imageUrl);
+        }
+      } else {
+        console.warn("No imageUrl found for item", i, "in combined PDF");
       }
 
-      /* ---------- BARCODE (SKU REMOVED) ---------- */
-      // Updated logic: only OrderID and Item Index
-      const barcodeText = `${order.orderId}-${i + 1}`;
-      y = ensureSpace(doc, y, 60);
-      y += addBarcode(doc, barcodeText, y);
+      // PAGE 2: Barcode page with details
+      doc.addPage();
+      y = margin;
+
+      // Get item details
+      const sku = item.sku || item.productSku || "N/A";
+      const quantity = item.quantity || item.qty || 1;
+      const size = item.size || item.variantSize || "N/A";
+      const name = item.name || "Customizable Product";
+
+      // Add product name
+      doc.setFontSize(10);
+      doc.setFont(undefined, "bold");
+      doc.text(`Name: ${name}`, getPageSize(doc).width / 2, y, { align: "center" });
+      y += 8;
+
+      // Add SKU
+      doc.setFontSize(10);
+      doc.setFont(undefined, "normal");
+      doc.text(`SKU: ${sku}`, getPageSize(doc).width / 2, y, { align: "center" });
+      y += 8;
+
+      // Add Quantity
+      doc.text(`Qty: ${quantity}`, getPageSize(doc).width / 2, y, { align: "center" });
+      y += 8;
+
+      // Add Size
+      doc.text(`Size: ${size}`, getPageSize(doc).width / 2, y, { align: "center" });
       y += 15;
 
-      /* ---------- SEPARATOR ---------- */
-      y = ensureSpace(doc, y, 15);
-      doc.setDrawColor(220);
-      doc.line(40, y, getPageSize(doc).width - 40, y);
-      y += 15;
+      // Create barcode with transparent background
+      const barcodeCanvas = document.createElement("canvas");
+      barcodeCanvas.width = 400;
+      barcodeCanvas.height = 200;
+      const barcodeCtx = barcodeCanvas.getContext("2d");
+      
+      // Clear canvas completely (transparent background - no white fill)
+      barcodeCtx.clearRect(0, 0, barcodeCanvas.width, barcodeCanvas.height);
+      
+      // Generate barcode with only orderId (no -1)
+      JsBarcode(barcodeCanvas, `${order.orderId}`, {
+        format: "CODE128",
+        width: 3,
+        height: 80,
+        displayValue: true,
+        fontSize: 20,
+        margin: 10,
+      });
+      
+      // Remove any white background that JsBarcode might have added
+      // by converting white pixels to transparent
+      const imageData = barcodeCtx.getImageData(0, 0, barcodeCanvas.width, barcodeCanvas.height);
+      const data = imageData.data;
+      for (let i = 0; i < data.length; i += 4) {
+        const r = data[i];
+        const g = data[i + 1];
+        const b = data[i + 2];
+        // If pixel is white (or very close to white), make it transparent
+        if (r > 250 && g > 250 && b > 250) {
+          data[i + 3] = 0; // Set alpha to 0 (transparent)
+        }
+      }
+      barcodeCtx.putImageData(imageData, 0, 0);
+      
+      const barcodeData = barcodeCanvas.toDataURL("image/png");
+
+      // Add barcode to PDF (centered)
+      const barcodeWidth = 100;
+      const barcodeHeight = 50;
+      const barcodeX = (getPageSize(doc).width - barcodeWidth) / 2;
+      doc.addImage(
+        barcodeData,
+        "PNG",
+        barcodeX,
+        y,
+        barcodeWidth,
+        barcodeHeight,
+        undefined,
+        "SLOW"
+      );
     }
   }
 
