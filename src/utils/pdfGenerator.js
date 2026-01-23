@@ -170,22 +170,56 @@ const addCenteredImage = (doc, imgData, y, maxWidth = 90) => {
   return imgHeight;
 };
 
-/* ================= BARCODE ================= */
+/* ================= BARCODE (HIGH QUALITY) ================= */
+// Generates a high-resolution barcode for orderId – large canvas, crisp bars, PNG output.
+const createHighQualityBarcode = (orderId) => {
+  // High-DPI canvas for sharp barcode (effective ~300 DPI when displayed at ~130mm)
+  const scale = 4;
+  const w = 400 * scale;
+  const h = 200 * scale;
+  const canvas = document.createElement("canvas");
+  canvas.width = w;
+  canvas.height = h;
+  const ctx = canvas.getContext("2d");
+  ctx.clearRect(0, 0, w, h);
+
+  JsBarcode(canvas, String(orderId), {
+    format: "CODE128",
+    width: 3 * scale,
+    height: 100 * scale,
+    displayValue: true,
+    fontSize: 24 * scale,
+    margin: 12 * scale,
+  });
+
+  // Optional: make white background transparent for cleaner embedding
+  const imageData = ctx.getImageData(0, 0, w, h);
+  const data = imageData.data;
+  for (let i = 0; i < data.length; i += 4) {
+    if (data[i] > 250 && data[i + 1] > 250 && data[i + 2] > 250) {
+      data[i + 3] = 0;
+    }
+  }
+  ctx.putImageData(imageData, 0, 0);
+
+  return canvas.toDataURL("image/png");
+};
+
 const addBarcode = (doc, text, y) => {
   const canvas = document.createElement("canvas");
 
   JsBarcode(canvas, text, {
     format: "CODE128",
     width: 2,
-    height: 35, // Reduced height
+    height: 35,
     displayValue: true,
-    fontSize: 12, // Slightly smaller font
+    fontSize: 12,
   });
 
   const img = canvas.toDataURL("image/jpeg", 0.6);
   const { width } = getPageSize(doc);
-  const w = 85; // Reduced width
-  const h = 35; // Reduced height
+  const w = 85;
+  const h = 35;
   const x = (width - w) / 2;
 
   doc.addImage(img, "JPEG", x, y, w, h);
@@ -477,84 +511,63 @@ export const generatePDF = async (order, onProgress) => {
       console.warn("No imageUrl found for item", i);
     }
 
-    // PAGE 2: Barcode page with details
+    // PAGE 2: Shirt image only (highest quality)
     doc.addPage();
     y = margin;
 
-    // Get item details
+    const pageWidth = getPageSize(doc).width;
+    const pageHeight = getPageSize(doc).height;
+    const minMargin = 8;
+
+    const shirtUrl = item.shirtImageUrl;
+    if (shirtUrl) {
+      const shirtImg = await safeLoadCustomImage(shirtUrl);
+      if (shirtImg) {
+        const props = doc.getImageProperties(shirtImg);
+        const r = props.width / props.height;
+        const maxW = pageWidth - minMargin * 2;
+        const maxH = Math.min(130, pageHeight * 0.5);
+        const shirtW = Math.min(maxW, maxH * r);
+        const shirtH = shirtW / r;
+        const shirtX = (pageWidth - shirtW) / 2;
+        doc.addImage(shirtImg, "PNG", shirtX, y, shirtW, shirtH, undefined, "SLOW");
+      }
+    }
+
+    // PAGE 3: Details + high-quality barcode (orderId)
+    doc.addPage();
+    y = margin;
+
     const sku = item.sku || item.productSku || "N/A";
     const quantity = item.quantity || item.qty || 1;
-    const size = item.size || item.variantSize || "N/A";
+    const size = item.sizeInfo || item.variantSize || "N/A";
     const name = item.name || "Customizable Product";
 
-    // Add product name
     doc.setFontSize(10);
     doc.setFont(undefined, "bold");
-    doc.text(`Name: ${name}`, getPageSize(doc).width / 2, y, { align: "center" });
+    doc.text(`Name: ${name}`, pageWidth / 2, y, { align: "center" });
     y += 8;
 
-    // Add SKU
     doc.setFontSize(10);
     doc.setFont(undefined, "normal");
-    doc.text(`SKU: ${sku}`, getPageSize(doc).width / 2, y, { align: "center" });
+    doc.text(`SKU: ${sku}`, pageWidth / 2, y, { align: "center" });
     y += 8;
-
-    // Add Quantity
-    doc.text(`Qty: ${quantity}`, getPageSize(doc).width / 2, y, { align: "center" });
+    doc.text(`Qty: ${quantity}`, pageWidth / 2, y, { align: "center" });
     y += 8;
+    doc.text(`Size: ${size}`, pageWidth / 2, y, { align: "center" });
+    y += 12;
 
-    // Add Size
-    doc.text(`Size: ${size}`, getPageSize(doc).width / 2, y, { align: "center" });
-    y += 15;
-
-      // Create barcode with transparent background
-      const barcodeCanvas = document.createElement("canvas");
-      barcodeCanvas.width = 400;
-      barcodeCanvas.height = 200;
-      const barcodeCtx = barcodeCanvas.getContext("2d");
-      
-      // Clear canvas completely (transparent background - no white fill)
-      barcodeCtx.clearRect(0, 0, barcodeCanvas.width, barcodeCanvas.height);
-      
-      // Generate barcode with only orderId (no -1)
-      // Note: JsBarcode may add background by default, we'll handle it
-      JsBarcode(barcodeCanvas, `${order.orderId}`, {
-        format: "CODE128",
-        width: 3,
-        height: 80,
-        displayValue: true,
-        fontSize: 20,
-        margin: 10,
-      });
-      
-      // Remove any white background that JsBarcode might have added
-      // by converting white pixels to transparent
-      const imageData = barcodeCtx.getImageData(0, 0, barcodeCanvas.width, barcodeCanvas.height);
-      const data = imageData.data;
-      for (let i = 0; i < data.length; i += 4) {
-        const r = data[i];
-        const g = data[i + 1];
-        const b = data[i + 2];
-        // If pixel is white (or very close to white), make it transparent
-        if (r > 250 && g > 250 && b > 250) {
-          data[i + 3] = 0; // Set alpha to 0 (transparent)
-        }
-      }
-      barcodeCtx.putImageData(imageData, 0, 0);
-    
-    const barcodeData = barcodeCanvas.toDataURL("image/png");
-
-    // Add barcode to PDF (centered)
-    const barcodeWidth = 100;
-    const barcodeHeight = 50;
-    const barcodeX = (getPageSize(doc).width - barcodeWidth) / 2;
+    const barcodeData = createHighQualityBarcode(order.orderId);
+    const barcodeWidthMm = 130;
+    const barcodeHeightMm = 52;
+    const barcodeX = (pageWidth - barcodeWidthMm) / 2;
     doc.addImage(
       barcodeData,
       "PNG",
       barcodeX,
       y,
-      barcodeWidth,
-      barcodeHeight,
+      barcodeWidthMm,
+      barcodeHeightMm,
       undefined,
       "SLOW"
     );
@@ -733,83 +746,63 @@ export const generateCombinedPDF = async (orders, dateKey, onProgress) => {
         console.warn("No imageUrl found for item", i, "in combined PDF");
       }
 
-      // PAGE 2: Barcode page with details
+      // PAGE 2: Shirt image only (highest quality)
       doc.addPage();
       y = margin;
 
-      // Get item details
-      const sku = item.sku || item.productSku || "N/A";
-      const quantity = item.quantity || item.qty || 1;
-      const size = item.size || item.variantSize || "N/A";
-      const name = item.name || "Customizable Product";
+      const pageWidthP2 = getPageSize(doc).width;
+      const pageHeightP2 = getPageSize(doc).height;
+      const minMarginP2 = 8;
 
-      // Add product name
-      doc.setFontSize(10);
-      doc.setFont(undefined, "bold");
-      doc.text(`Name: ${name}`, getPageSize(doc).width / 2, y, { align: "center" });
-      y += 8;
-
-      // Add SKU
-      doc.setFontSize(10);
-      doc.setFont(undefined, "normal");
-      doc.text(`SKU: ${sku}`, getPageSize(doc).width / 2, y, { align: "center" });
-      y += 8;
-
-      // Add Quantity
-      doc.text(`Qty: ${quantity}`, getPageSize(doc).width / 2, y, { align: "center" });
-      y += 8;
-
-      // Add Size
-      doc.text(`Size: ${size}`, getPageSize(doc).width / 2, y, { align: "center" });
-      y += 15;
-
-      // Create barcode with transparent background
-      const barcodeCanvas = document.createElement("canvas");
-      barcodeCanvas.width = 400;
-      barcodeCanvas.height = 200;
-      const barcodeCtx = barcodeCanvas.getContext("2d");
-      
-      // Clear canvas completely (transparent background - no white fill)
-      barcodeCtx.clearRect(0, 0, barcodeCanvas.width, barcodeCanvas.height);
-      
-      // Generate barcode with only orderId (no -1)
-      JsBarcode(barcodeCanvas, `${order.orderId}`, {
-        format: "CODE128",
-        width: 3,
-        height: 80,
-        displayValue: true,
-        fontSize: 20,
-        margin: 10,
-      });
-      
-      // Remove any white background that JsBarcode might have added
-      // by converting white pixels to transparent
-      const imageData = barcodeCtx.getImageData(0, 0, barcodeCanvas.width, barcodeCanvas.height);
-      const data = imageData.data;
-      for (let i = 0; i < data.length; i += 4) {
-        const r = data[i];
-        const g = data[i + 1];
-        const b = data[i + 2];
-        // If pixel is white (or very close to white), make it transparent
-        if (r > 250 && g > 250 && b > 250) {
-          data[i + 3] = 0; // Set alpha to 0 (transparent)
+      const shirtUrl = item.shirtImageUrl;
+      if (shirtUrl) {
+        const shirtImg = await safeLoadCustomImage(shirtUrl);
+        if (shirtImg) {
+          const props = doc.getImageProperties(shirtImg);
+          const r = props.width / props.height;
+          const maxW = pageWidthP2 - minMarginP2 * 2;
+          const maxH = Math.min(130, pageHeightP2 * 0.5);
+          const shirtW = Math.min(maxW, maxH * r);
+          const shirtH = shirtW / r;
+          const shirtX = (pageWidthP2 - shirtW) / 2;
+          doc.addImage(shirtImg, "PNG", shirtX, y, shirtW, shirtH, undefined, "SLOW");
         }
       }
-      barcodeCtx.putImageData(imageData, 0, 0);
-      
-      const barcodeData = barcodeCanvas.toDataURL("image/png");
 
-      // Add barcode to PDF (centered)
-      const barcodeWidth = 100;
-      const barcodeHeight = 50;
-      const barcodeX = (getPageSize(doc).width - barcodeWidth) / 2;
+      // PAGE 3: Details + high-quality barcode (orderId)
+      doc.addPage();
+      y = margin;
+
+      const sku = item.sku || item.productSku || "N/A";
+      const quantity = item.quantity || item.qty || 1;
+      const size = item.sizeInfo || item.variantSize || "N/A";
+      const name = item.name || "Customizable Product";
+
+      doc.setFontSize(10);
+      doc.setFont(undefined, "bold");
+      doc.text(`Name: ${name}`, pageWidthP2 / 2, y, { align: "center" });
+      y += 8;
+
+      doc.setFontSize(10);
+      doc.setFont(undefined, "normal");
+      doc.text(`SKU: ${sku}`, pageWidthP2 / 2, y, { align: "center" });
+      y += 8;
+      doc.text(`Qty: ${quantity}`, pageWidthP2 / 2, y, { align: "center" });
+      y += 8;
+      doc.text(`Size: ${size}`, pageWidthP2 / 2, y, { align: "center" });
+      y += 12;
+
+      const barcodeData = createHighQualityBarcode(order.orderId);
+      const barcodeWidthMm = 130;
+      const barcodeHeightMm = 52;
+      const barcodeX = (pageWidthP2 - barcodeWidthMm) / 2;
       doc.addImage(
         barcodeData,
         "PNG",
         barcodeX,
         y,
-        barcodeWidth,
-        barcodeHeight,
+        barcodeWidthMm,
+        barcodeHeightMm,
         undefined,
         "SLOW"
       );
