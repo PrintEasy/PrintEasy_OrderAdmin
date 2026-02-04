@@ -98,6 +98,18 @@ const safeLoadCustomImage = async (url) => {
   }
 };
 
+/* ================= SIZE FORMAT ================= */
+// Format size for PDF: "26Y" → "2-6Y", "46Y" → "4-6Y", "26Y 46Y" → "2-6Y 4-6Y"
+const formatSizeForPdf = (sizeInfo) => {
+  if (!sizeInfo || typeof sizeInfo !== "string") return "N/A";
+  const trimmed = sizeInfo.trim();
+  if (!trimmed) return "N/A";
+  return trimmed
+    .split(/\s+/)
+    .map((part) => (part.length >= 2 ? part[0] + "-" + part.slice(1) : part))
+    .join(" ");
+};
+
 /* ================= PAGE HELPERS ================= */
 const getPageSize = (doc) => ({
   width: doc.internal.pageSize.getWidth(),
@@ -540,7 +552,7 @@ export const generatePDF = async (order, onProgress) => {
 
     const sku = item.sku || item.productSku || "N/A";
     const quantity = item.quantity || item.qty || 1;
-    const size = item.sizeInfo || item.variantSize || "N/A";
+    const size = formatSizeForPdf(item.sizeInfo || item.variantSize);
     const name = item.name || "Customizable Product";
 
     doc.setFontSize(10);
@@ -775,7 +787,7 @@ export const generateCombinedPDF = async (orders, dateKey, onProgress) => {
 
       const sku = item.sku || item.productSku || "N/A";
       const quantity = item.quantity || item.qty || 1;
-      const size = item.sizeInfo || item.variantSize || "N/A";
+      const size = formatSizeForPdf(item.sizeInfo || item.variantSize);
       const name = item.name || "Customizable Product";
 
       doc.setFontSize(10);
